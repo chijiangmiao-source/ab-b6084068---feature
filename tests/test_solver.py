@@ -24,10 +24,11 @@ CORE = Path(os.environ.get(
 assert CORE.exists(), f"native core missing: {CORE}"
 
 
-def make(nodes, edges, endpoints):
-    return parse_problem(
-        {"nodes": nodes, "edges": edges, "endpoints": endpoints}
-    )
+def make(nodes, edges, endpoints, max_edges=None):
+    body = {"nodes": nodes, "edges": edges, "endpoints": endpoints}
+    if max_edges is not None:
+        body["max_edges"] = max_edges
+    return parse_problem(body)
 
 
 def edge(id_, s, t, c):
@@ -172,6 +173,133 @@ class TestValidation:
             })
         assert ctx.value.code == "MISSING_FIELD"
         assert ctx.value.pointer == "/edges/0/cost"
+
+    def test_max_edges_defaults_to_none(self):
+        p = make(["a", "b"], [edge("e1", "a", "b", 1)], ["a", "b"])
+        assert p.max_edges is None
+
+    def check_bad_max_edges(self, bad, code):
+        with assert_raises(ValidationError) as ctx:
+            make(["a", "b"], [edge("e1", "a", "b", 1)], ["a", "b"],
+                 max_edges=bad)
+        assert ctx.value.code == code, (bad, ctx.value.code)
+        assert ctx.value.pointer == "/max_edges"
+
+    def test_bad_max_edges(self):
+        for bad, code in [
+            (0, "MAX_EDGES_OUT_OF_RANGE"),
+            (-1, "MAX_EDGES_OUT_OF_RANGE"),
+            (221, "MAX_EDGES_OUT_OF_RANGE"),
+            (True, "INVALID_MAX_EDGES"),
+            (2.0, "INVALID_MAX_EDGES"),
+            ("3", "INVALID_MAX_EDGES"),
+        ]:
+            self.check_bad_max_edges(bad, code)
+        # An explicit JSON null reaches the field (unlike omission).
+        with assert_raises(ValidationError) as ctx:
+            parse_problem({
+                "nodes": ["a", "b"],
+                "edges": [edge("e1", "a", "b", 1)],
+                "endpoints": ["a", "b"],
+                "max_edges": None,
+            })
+        assert ctx.value.code == "INVALID_MAX_EDGES"
+        assert ctx.value.pointer == "/max_edges"
+
+    def test_max_edges_at_bounds_ok(self):
+        p = make(["a", "b"], [edge("e1", "a", "b", 1)], ["a", "b"],
+                 max_edges=220)
+        assert p.max_edges == 220
+
+
+# --------------------------------------------------------------------------
+# Solver: edge-segment budget (max_edges)
+# --------------------------------------------------------------------------
+
+class TestBudget:
+    def path_vs_direct(self, L):
+        nodes = ["a", "b", "c", "d"]
+        edges = [
+            edge("p1", "a", "b", 1),
+            edge("p2", "b", "c", 1),
+            edge("p3", "c", "d", 1),
+            edge("dir", "a", "d", 9),
+        ]
+        return make(nodes, edges, ["a", "d"], max_edges=L)
+
+    def test_unconstrained_prefers_cheap_path(self):
+        cost, _, ids = solve(self.path_vs_direct(None))
+        assert (cost, ids) == (3, ("p1", "p2", "p3"))
+
+    def test_budget_forces_direct_edge(self):
+        cost, selected, ids = solve(self.path_vs_direct(1))
+        assert cost == 9
+        assert ids == ("dir",)
+        assert len(selected) == 1
+
+    def test_budget_equal_to_minimum_tree_size(self):
+        cost, _, ids = solve(self.path_vs_direct(3))
+        assert (cost, ids) == (3, ("p1", "p2", "p3"))
+
+    def test_large_budget_matches_unconstrained(self):
+        cost, _, ids = solve(self.path_vs_direct(59))
+        assert (cost, ids) == (3, ("p1", "p2", "p3"))
+
+    def test_budget_infeasible_reports_minimum(self):
+        # Three terminals on a chain need at least 2 segments.
+        p = make(
+            ["a", "b", "c"],
+            [edge("e1", "a", "b", 1), edge("e2", "b", "c", 1)],
+            ["a", "b", "c"],
+            max_edges=1,
+        )
+        with assert_raises(TopologyError) as ctx:
+            solve(p)
+        assert ctx.value.code == "BUDGET_INFEASIBLE"
+        assert ctx.value.min_edges == 2
+        assert ctx.value.pointer == "/max_edges"
+
+    def test_budget_infeasible_minimum_uses_relay_path(self):
+        # Terminals a, d are connected only by a 3-edge chain and two cheap
+        # branches; the shortest feasible tree has 3 edges.
+        nodes = ["a", "b", "c", "d"]
+        edges = [
+            edge("ab", "a", "b", 100),
+            edge("bc", "b", "c", 100),
+            edge("cd", "c", "d", 100),
+        ]
+        p = make(nodes, edges, ["a", "d"], max_edges=2)
+        with assert_raises(TopologyError) as ctx:
+            solve(p)
+        assert ctx.value.code == "BUDGET_INFEASIBLE"
+        assert ctx.value.min_edges == 3
+
+    def test_budget_changes_equicost_witness(self):
+        # A two-edge relay path and one direct edge cost the same total.
+        # Unconstrained lex arbitration picks the relay (ids aaa.. < zzz);
+        # a 1-segment budget must instead pick the direct edge -- this cannot
+        # be obtained by truncating the unconstrained witness.
+        nodes = ["a", "b", "x"]
+        edges = [
+            edge("aaa", "a", "x", 3),
+            edge("bbb", "x", "b", 3),
+            edge("zzz", "a", "b", 6),
+        ]
+        cost_u, _, ids_u = solve(make(nodes, edges, ["a", "b"]))
+        assert (cost_u, ids_u) == (6, ("aaa", "bbb"))
+        cost_b, selected, ids_b = solve(
+            make(nodes, edges, ["a", "b"], max_edges=1)
+        )
+        assert cost_b == 6
+        assert ids_b == ("zzz",)
+        assert len(selected) == 1
+
+    def test_budget_tie_arbitration_within_budget(self):
+        # Two 1-edge options tie on cost and budget; lex rule still decides.
+        nodes = ["a", "b"]
+        edges = [edge("zz", "a", "b", 4), edge("aa", "a", "b", 4)]
+        cost, _, ids = solve(make(nodes, edges, ["a", "b"], max_edges=1))
+        assert (cost, ids) == (4, ("aa",))
 
 
 # --------------------------------------------------------------------------

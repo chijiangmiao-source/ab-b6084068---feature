@@ -30,7 +30,7 @@ MAX_BODY_BYTES = 2_000_000
 def _solve_payload(payload: Any) -> dict[str, Any]:
     problem = parse_problem(payload)
     cost, selected, edge_ids = solve(problem)
-    return {
+    result: dict[str, Any] = {
         "cost": cost,
         "edge_set": list(edge_ids),
         "edges": [
@@ -44,6 +44,12 @@ def _solve_payload(payload: Any) -> dict[str, Any]:
         ],
         "adjacency": build_adjacency(problem.nodes, selected),
     }
+    # The segment count is echoed only for requests that carried a budget, so
+    # requests without max_edges stay item-for-item compatible with the
+    # historical response shape.
+    if problem.max_edges is not None:
+        result["edge_count"] = len(selected)
+    return result
 
 
 class AuditHandler(BaseHTTPRequestHandler):

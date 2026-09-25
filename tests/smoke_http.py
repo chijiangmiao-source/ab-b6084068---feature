@@ -5,6 +5,9 @@ Zero third-party dependencies (urllib only). Covers:
   * a successful minimum-subnet solve with response consistency,
   * canonical tie arbitration (lexicographic edge ids, request-order stable),
   * infeasibility boundaries: dangling endpoint, split components,
+    segment-budget (max_edges) infeasibility with the minimum feasible count,
+  * the constrained optimum and its echoed segment count, plus item-level
+    compatibility of requests that omit max_edges,
   * stable locatable 4xx errors: malformed JSON, non-positive cost,
     self loop, duplicate edge id, unknown node,
   * request isolation: a failing audit must not bleed into the next one.
@@ -258,6 +261,115 @@ def main() -> int:
           "good request after bad is fresh", str(b2))
     check(s3 == 200 and b3 == b2, "identical requests -> identical results",
           f"{b2} != {b3}")
+
+    # --- 6. edge-segment budget (max_edges) -------------------------------
+    print("[6] constrained optimum, insufficient budget, legacy compat")
+    budget_graph = {
+        "nodes": ["A", "B", "C", "D"],
+        "edges": [
+            edge("p1", "A", "B", 1),
+            edge("p2", "B", "C", 1),
+            edge("p3", "C", "D", 1),
+            edge("dir", "A", "D", 9),
+        ],
+        "endpoints": ["A", "D"],
+    }
+
+    # 6a. constrained optimum: a 1-segment budget must pick the expensive
+    # direct edge rather than truncate the 3-edge cheapest witness.
+    constrained = dict(budget_graph, max_edges=1)
+    status, body = request("POST", "/api/audit", constrained)
+    check(status == 200, "budget status 200", str(body))
+    if status == 200:
+        check(body.get("cost") == 9, "budget forces direct edge cost 9",
+              str(body.get("cost")))
+        check(body.get("edge_set") == ["dir"], "budget witness [dir]",
+              str(body.get("edge_set")))
+        check(body.get("edge_count") == 1, "echoes actual segment count",
+              str(body.get("edge_count")))
+        check(len(body.get("edges", [])) == 1, "edges matches one segment",
+              str(body.get("edges")))
+        total = sum(e["cost"] for e in body["edges"])
+        check(total == body["cost"], "budget edge costs sum to cost",
+              f"{total} != {body['cost']}")
+
+    # A permissive budget returns the cheap path, still echoing the count.
+    status, body = request("POST", "/api/audit",
+                           dict(budget_graph, max_edges=3))
+    check(status == 200, "permissive budget status 200", str(body))
+    check(body.get("cost") == 3 and body.get("edge_set") == ["p1", "p2", "p3"],
+          "permissive budget keeps cheap path", str(body))
+    check(body.get("edge_count") == 3, "permissive budget echoes 3",
+          str(body.get("edge_count")))
+
+    # 6b. budget insufficient: endpoints connected, but no subnet fits.
+    status, body = request("POST", "/api/audit",
+                           dict(budget_graph, max_edges=0))
+    check(status == 400, "max_edges=0 rejected at field", f"got {status}")
+    check(body.get("code") == "MAX_EDGES_OUT_OF_RANGE", "range error code",
+          str(body))
+    check(body.get("pointer") == "/max_edges", "max_edges pointer",
+          str(body.get("pointer")))
+
+    tight = {
+        "nodes": ["T1", "T2", "T3"],
+        "edges": [
+            edge("e1", "T1", "T2", 1),
+            edge("e2", "T2", "T3", 1),
+        ],
+        "endpoints": ["T1", "T2", "T3"],
+        "max_edges": 1,
+    }
+    status, body = request("POST", "/api/audit", tight)
+    check(status == 422, "insufficient budget -> 422", f"got {status}")
+    check(body.get("code") == "BUDGET_INFEASIBLE", "stable budget code",
+          str(body))
+    check(body.get("min_edges") == 2, "minimum feasible count reported",
+          str(body.get("min_edges")))
+    check(body.get("pointer") == "/max_edges", "budget error pointer",
+          str(body.get("pointer")))
+    check("edge_set" not in body and "edges" not in body
+          and "adjacency" not in body,
+          "no partial subnet on budget failure")
+
+    # Larger minimum: three leaves all relay through a hub (needs 3 edges).
+    star = {
+        "nodes": ["T1", "T2", "T3", "R"],
+        "edges": [
+            edge("e1", "T1", "R", 1),
+            edge("e2", "T2", "R", 1),
+            edge("e3", "T3", "R", 1),
+        ],
+        "endpoints": ["T1", "T2", "T3"],
+        "max_edges": 2,
+    }
+    status, body = request("POST", "/api/audit", star)
+    check(status == 422 and body.get("code") == "BUDGET_INFEASIBLE",
+          "star relay min count boundary -> 422", str(body))
+    check(body.get("min_edges") == 3, "star relay reports min 3",
+          str(body.get("min_edges")))
+
+    # Bad type/format is rejected by field position like other fields.
+    status, body = request("POST", "/api/audit",
+                           dict(budget_graph, max_edges="2"))
+    check(status == 400 and body.get("code") == "INVALID_MAX_EDGES",
+          "non-integer max_edges -> 400", str(body))
+    check(body.get("pointer") == "/max_edges", "type error pointer",
+          str(body.get("pointer")))
+
+    # 6c. legacy request compatibility: no max_edges -> identical response,
+    # with NO edge_count field item present.
+    legacy = dict(budget_graph)
+    status, body = request("POST", "/api/audit", legacy)
+    check(status == 200, "legacy status 200", str(body))
+    check("edge_count" not in body, "legacy response omits edge_count",
+          str(sorted(body)))
+    check(body.get("cost") == 3, "legacy optimal cost 3",
+          str(body.get("cost")))
+    check(body.get("edge_set") == ["p1", "p2", "p3"], "legacy edge set",
+          str(body.get("edge_set")))
+    check(set(body) == {"cost", "edge_set", "edges", "adjacency"},
+          "legacy response keys unchanged", str(sorted(body)))
 
     print("-" * 60)
     if _failures:

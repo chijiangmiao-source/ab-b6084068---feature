@@ -108,11 +108,17 @@ def _encode_instance(problem: Problem) -> tuple[str, list[Edge]]:
 
     The tie-break rule compares ascending edge-id lists lexicographically, so
     the core's edge input order MUST be id-sorted, not request-array order.
+    The optional fourth header field carries ``max_edges``; omitting it keeps
+    the historical (unconstrained) protocol exactly.
     Returns the payload and the ordered edges for position mapping.
     """
     ordered = sorted(problem.edges, key=lambda e: e.id)
+    header = (
+        f"{len(problem.nodes)} {len(ordered)} {len(problem.endpoints)}"
+        + (f" {problem.max_edges}" if problem.max_edges is not None else "")
+    )
     lines = [
-        f"{len(problem.nodes)} {len(ordered)} {len(problem.endpoints)}",
+        header,
         " ".join(str(v) for v in problem.endpoints),
     ]
     for e in ordered:
@@ -122,10 +128,12 @@ def _encode_instance(problem: Problem) -> tuple[str, list[Edge]]:
 
 def run_core(
     problem: Problem, timeout: float = 30.0
-) -> tuple[int, tuple[int, ...], str, list[Edge]]:
+) -> tuple[int, tuple[int, ...], str, int | None, list[Edge]]:
     """Invoke the native solver.
 
-    Returns (cost, positions into the id-sorted edge list, status, ordered).
+    Returns ``(cost, positions, status, min_feasible_edges, ordered)``:
+    ``min_feasible_edges`` is populated only for the BUDGET_INFEASIBLE
+    status (the minimum segment count of any-cost connecting subnet).
     """
     payload, ordered = _encode_instance(problem)
     proc = subprocess.run(
@@ -146,20 +154,42 @@ def run_core(
         cost = int(tokens[1])
         count = int(tokens[2])
         positions = tuple(int(x) for x in tokens[3:3 + count])
-        return cost, positions, status, ordered
-    return 0, (), status, ordered
+        return cost, positions, status, None, ordered
+    if status == "BUDGET_INFEASIBLE":
+        min_feasible = int(tokens[1])
+        return 0, (), status, min_feasible, ordered
+    return 0, (), status, None, ordered
 
 
 def solve(problem: Problem) -> tuple[int, list[Edge], tuple[str, ...]]:
-    """Return ``(cost, edges, canonical edge ids)`` for the optimal subnet."""
+    """Return ``(cost, edges, canonical edge ids)`` for the optimal subnet.
+
+    When ``problem.max_edges`` is set, optimality is taken only over subnets
+    whose edge count does not exceed that budget: the kernel tracks the
+    segment count inside every terminal-subset state rather than pruning the
+    unconstrained answer. If endpoints are connected in the original graph but
+    no within-budget subnet exists, raises ``BUDGET_INFEASIBLE`` carrying the
+    minimum feasible segment count (and never a partial edge set).
+    """
     check_feasibility(problem)
-    cost, positions, status, ordered = run_core(problem)
+    cost, positions, status, min_feasible, ordered = run_core(problem)
 
     if status == "UNCONNECTED":
         # Defensive: check_feasibility should already have caught this.
         raise TopologyError(
             "ENDPOINTS_UNCONNECTED",
             "endpoints cannot be joined by any edge set",
+        )
+    if status == "BUDGET_INFEASIBLE":
+        assert min_feasible is not None
+        budget = problem.max_edges
+        raise TopologyError(
+            "BUDGET_INFEASIBLE",
+            "endpoints are connected but no connecting subnet fits the "
+            f"max_edges={budget} budget; the minimum feasible segment count "
+            f"is {min_feasible}",
+            pointer="/max_edges",
+            min_edges=min_feasible,
         )
     if status == "OVERFLOW":  # pragma: no cover - documented hard boundary
         raise TopologyError(
@@ -171,6 +201,8 @@ def solve(problem: Problem) -> tuple[int, list[Edge], tuple[str, ...]]:
     chosen_ids = tuple(e.id for e in selected)
     if chosen_ids != tuple(sorted(chosen_ids)):
         raise RuntimeError("solver invariant: witness ids not ascending")
+    if problem.max_edges is not None and len(selected) > problem.max_edges:
+        raise RuntimeError("solver invariant: witness exceeds max_edges")
 
     _verify_witness(problem, selected, cost)
     return cost, selected, chosen_ids

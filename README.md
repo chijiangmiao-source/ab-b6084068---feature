@@ -74,9 +74,15 @@ python3 tests/verify.py            # 需先启动服务，默认 http://127.0.0.
     {"id": "e3", "source": "C", "target": "R", "cost": 5},
     {"id": "p1", "source": "A", "target": "B", "cost": 9}
   ],
-  "endpoints": ["A", "B", "C"]
+  "endpoints": ["A", "B", "C"],
+  "max_edges": 3
 }
 ```
+
+`max_edges` 可省略：缺省时为无约束审计，请求与响应与旧版逐项一致。
+提供时（1–220 的正整数）只在**边数不超过该段数预算**的连通子网中比较成本；
+求解器不会先求无约束最优再截断，而是把段数作为终端子集 DP 状态的一部分
+（见“算法与并列裁决”）。
 
 约束：节点 2–60 个且为唯一 ASCII 标识；边 1–220 条，边标识唯一、成本为
 正整数；允许平行边，禁止自环；端点 2–10 个且必须在节点表中声明。
@@ -101,13 +107,32 @@ python3 tests/verify.py            # 需先启动服务，默认 http://127.0.0.
       {"to": "B", "edge": "e2", "cost": 5},
       {"to": "C", "edge": "e3", "cost": 5}
     ]
-  }
+  },
+  "edge_count": 3
 }
 ```
 
 - `cost`：最低总成本；`edge_set`：按 ASCII 升序排列的规范边标识；
 - `edges`：对应边的完整描述（顺序无关，按 id 排序）；
-- `adjacency`：**仅由所选边集导出**的连通邻接表（未使用节点不出现）。
+- `adjacency`：**仅由所选边集导出**的连通邻接表（未使用节点不出现）；
+- `edge_count`：所选子网的**实际段数**，仅在请求提供 `max_edges` 时回显；
+  未提供该字段的旧请求响应中不包含此键，其余字段逐项不变。
+
+若端点在原图中连通、但不存在不超过预算的连通子网，返回 422：
+
+```json
+{
+  "code": "BUDGET_INFEASIBLE",
+  "message": "endpoints are connected but no connecting subnet fits the max_edges=1 budget; the minimum feasible segment count is 2",
+  "pointer": "/max_edges",
+  "min_edges": 2
+}
+```
+
+`min_edges` 指出**任意成本下**连通全部端点所需的最少段数；响应绝不返回
+部分边集。`max_edges` 取值/格式错误（非整数、布尔、越界、JSON null）按
+字段位置 `/max_edges` 拒绝（400 `INVALID_MAX_EDGES` /
+`MAX_EDGES_OUT_OF_RANGE`），与其它字段的错误规则一致。
 
 ### 错误（稳定且可定位，绝不返回部分子网或沿用上次结果）
 
@@ -121,8 +146,10 @@ JSON Pointer 风格定位（如 `/edges/3/cost`、`/endpoints/1`）。
 | 400 | `EDGE_COUNT_OUT_OF_RANGE` / `DUPLICATE_EDGE_ID` / `SELF_LOOP` / `UNKNOWN_NODE` | 边结构问题 |
 | 400 | `INVALID_COST` / `NON_POSITIVE_COST` / `COST_OUT_OF_RANGE` | 成本问题 |
 | 400 | `ENDPOINT_COUNT_OUT_OF_RANGE` / `DUPLICATE_ENDPOINT` / `UNKNOWN_ENDPOINT` | 端点问题 |
+| 400 | `INVALID_MAX_EDGES` / `MAX_EDGES_OUT_OF_RANGE` | `max_edges` 非正整数或越界（定位 `/max_edges`） |
 | 422 | `DANGLING_ENDPOINT` | 端点无任何关联边（悬空） |
 | 422 | `ENDPOINTS_UNCONNECTED` | 端点位于不同连通分量（无法连通），附 `components` |
+| 422 | `BUDGET_INFEASIBLE` | 端点连通但无满足段数预算的子网，附 `min_edges`（最少可行段数），不返回部分边集 |
 | 405/404/411/413/500 | 对应语义码 | 方法错误、路径不存在、缺少长度、载荷过大、内部错误 |
 
 每次请求都重新构建问题并启动一次独立内核进程，失败不会残留任何状态。
@@ -135,11 +162,20 @@ JSON Pointer 风格定位（如 `/edges/3/cost`、`/endpoints/1`）。
    合并阶段在同一顶点连接两个终端子树（枚举所有二元划分，锚定位去重）。
 3. **多源最短路闭包**：每个子集以全部顶点的合并标签为种子，跑一次
    多源 Dijkstra 完成闭包松弛。
-4. **规范见证**：仅在 DP 状态中保留单一（代价，见证）对不能保证全局
-   字典序最优。因此先求出最优成本 `B`，再按边标识 ASCII 升序做贪心前缀
-   扫描——对每条边询问“是否存在包含已选前缀与该边、成本恰为 `B` 的连通
-   树”，该 oracle 用并查集收缩必选边后在收缩多重图上再做一次 Steiner DP。
-   这是多项式次数的 DP 调用（≤ 边数 + 1），不枚举边集。
+4. **段数预算的状态内嵌**：提供 `max_edges` 时，每个 `(mask, v)` 状态
+   保存一条关于“段数→最小成本”的 **Pareto 前沿**（同段数保留最小成本，
+   被支配点剔除）。合并阶段对两条前沿做卷积（段数相加、成本相加），闭包
+   阶段在**扩展状态空间 `(顶点, 段数)`** 上做多源 Dijkstra（跨过一条边
+   时段数 +1）。一次 DP 同时得到无约束最优成本 `B`、任意成本下的最少
+   可行段数 `h`、以及预算内最优成本 `B_L`——不是先求无约束答案再截断，
+   也不枚举边集。无预算时前沿退化为单点，与原行为完全一致。
+5. **预算下的规范见证**：确定预算内最优成本后，按边标识 ASCII 升序做
+   贪心前缀扫描，每个候选边询问“是否存在包含已选前缀与该边、避免已拒
+   边，且**段数不超预算**、成本恰为目标值的连通树”；该 oracle 用并查集
+   收缩必选边后，带着**剩余段数额度**在收缩多重图上再跑一次 Pareto
+   Steiner DP。预算约束下并列方案仍由同一套升序边表字典序**唯一见证**
+   裁决。DP 调用次数为多项式（≤ 边数 + 1），不枚举边集。
 
 `scripts/cross_validate*.py` 对 5000+ 随机小图与暴力枚举逐项核对
-（成本、无解、字典序见证、平行边、并列）。
+（成本、无解、字典序见证、平行边、并列）；`max_edges` 语义由额外的
+预算暴力枚举（受限最优、`min_edges` 诊断、旧协议兼容）核对。

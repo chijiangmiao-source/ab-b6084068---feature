@@ -5,12 +5,17 @@ The problem instance is::
     {
       "nodes":     [unique ASCII node ids, 2..60],
       "edges":     [{"id", "source", "target", "cost"}, 1..220],
-      "endpoints": [calibration endpoint node ids, 2..10]
+      "endpoints": [calibration endpoint node ids, 2..10],
+      "max_edges": optional positive integer segment budget, 1..220
     }
 
 Edges are undirected. Parallel edges between the same node pair are allowed;
 self loops and duplicate edge identifiers are rejected. Costs must be positive
 integers (bool is rejected explicitly so ``True`` does not sneak through as 1).
+
+``max_edges`` is optional: omitting it selects the unconstrained audit, whose
+behaviour and response shape are unchanged. When present, the optimum is taken
+only over subnets whose edge count does not exceed the budget.
 """
 
 from __future__ import annotations
@@ -26,6 +31,12 @@ MAX_EDGES = 220
 MIN_EDGES = 1
 MAX_ENDPOINTS = 10
 MIN_ENDPOINTS = 2
+# Optional segment budget bounds (1..MAX_EDGES; a spanning tree of a 60-node
+# graph needs at most 59 edges, so 220 always leaves slack; the upper bound
+# keeps the value in the kernel's representable range and rejects bad input
+# at the field position).
+MIN_MAX_EDGES = 1
+MAX_MAX_EDGES = MAX_EDGES
 # The native core uses signed-64 arithmetic with a saturated infinity of
 # LLONG_MAX/4. Bound each cost so the largest possible witness (220 edges)
 # stays strictly below that threshold: every feasible optimum is then exact.
@@ -47,6 +58,9 @@ class Problem:
     index: dict[str, int]
     edges: list[Edge]
     endpoints: list[int]  # internal indices, first-seen order
+    # None = unconstrained audit; an int restricts the witness to at most that
+    # many edge segments.
+    max_edges: int | None = None
 
 
 def _require_object(value: Any) -> None:
@@ -240,6 +254,29 @@ def _parse_edges(
     return edges
 
 
+def _parse_max_edges(body: dict[str, Any]) -> int | None:
+    if "max_edges" not in body:
+        return None
+    value = body["max_edges"]
+    pointer = "/max_edges"
+    # bool is a subclass of int in Python; reject it explicitly (same rule
+    # as edge costs).
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(
+            "INVALID_MAX_EDGES",
+            "max_edges must be a positive integer",
+            pointer,
+        )
+    if not (MIN_MAX_EDGES <= value <= MAX_MAX_EDGES):
+        raise ValidationError(
+            "MAX_EDGES_OUT_OF_RANGE",
+            f"max_edges must be between {MIN_MAX_EDGES} and "
+            f"{MAX_MAX_EDGES}, got {value}",
+            pointer,
+        )
+    return value
+
+
 def parse_problem(payload: Any) -> Problem:
     """Validate the raw JSON payload and build an indexed problem."""
     _require_object(payload)
@@ -247,4 +284,11 @@ def parse_problem(payload: Any) -> Problem:
     index = {label: i for i, label in enumerate(nodes)}
     edges = _parse_edges(payload, index)
     endpoints = _parse_endpoints(payload, index)
-    return Problem(nodes=nodes, index=index, edges=edges, endpoints=endpoints)
+    max_edges = _parse_max_edges(payload)
+    return Problem(
+        nodes=nodes,
+        index=index,
+        edges=edges,
+        endpoints=endpoints,
+        max_edges=max_edges,
+    )

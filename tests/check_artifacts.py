@@ -56,8 +56,50 @@ def main() -> int:
         tokens = proc.stdout.split()
         check(tokens[:1] == ["OK"], "core reports OK", proc.stdout)
         check(tokens[1:2] == ["3"], "core finds cost 3", proc.stdout)
-        # Cheapest 0-3 route is the 3-edge path (ids 0,1,2) versus edge 3 (9).
+        # Cheapest 0-3 route is the 3-edge path (ids 0,1) versus edge 3 (9).
         check(tokens[2:3] == ["3"], "core selects 3 edges", proc.stdout)
+
+        # Segment budget: a 2-edge cap forces the expensive direct edge (9),
+        # exercising the Pareto (edge-count) DP rather than truncation.
+        proc = subprocess.run(
+            [str(core)],
+            input="4 4 2 2\n0 3\n0 1 1\n1 2 1\n2 3 1\n0 3 9\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        tokens = proc.stdout.split()
+        check(tokens[:1] == ["OK"], "budget run reports OK", proc.stdout)
+        check(tokens[1:3] == ["9", "1"], "budget picks direct cost 9 / 1 edge",
+              proc.stdout)
+
+        # Budget below the connecting chain's minimum: 3-edge path only.
+        proc = subprocess.run(
+            [str(core)],
+            input="4 3 2 1\n0 3\n0 1 1\n1 2 1\n2 3 1\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        tokens = proc.stdout.split()
+        check(tokens[:1] == ["BUDGET_INFEASIBLE"],
+              "tight budget reported distinctly", proc.stdout)
+        check(tokens[1:2] == ["3"], "minimum feasible count is 3",
+              proc.stdout)
+
+        # The unconstrained header (with an explicit -1) stays compatible.
+        proc = subprocess.run(
+            [str(core)],
+            input="4 4 2 -1\n0 3\n0 1 1\n1 2 1\n2 3 1\n0 3 9\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        check(proc.stdout.split()[:3] == ["OK", "3", "3"],
+              "explicit -1 budget is unconstrained", proc.stdout)
 
     print("[artifact] python package import")
     try:
