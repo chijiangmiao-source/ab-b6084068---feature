@@ -1,14 +1,16 @@
 """Steiner subnet solver: Python front-end around the native DP core.
 
 The algorithmic work (terminal-subset Dreyfus-Wagner DP, node aggregation
-merge by disjoint-set union, multi-source shortest-path closure) lives in
-``core/steiner.c``; see its header comment for the recurrence and the greedy
-oracle-based canonical witness construction. This module:
+merge by disjoint-set union, multi-source shortest-path closure -- all with
+the segment count folded into the DP state when a budget is supplied) lives
+in ``core/steiner.c``; see its header comment for the recurrence and the
+greedy oracle-based canonical witness construction. This module:
 
 * pre-checks topology with a DSU aggregation pass so dangling endpoints and
   split components get precise, locatable errors;
-* streams the indexed instance to the native core (one short-lived process
-  per audit, so no result can ever leak between requests);
+* streams the indexed instance (including the optional segment budget) to
+  the native core (one short-lived process per audit, so no result can ever
+  leak between requests);
 * rebuilds the canonical edge set and derives its adjacency list.
 """
 
@@ -108,11 +110,15 @@ def _encode_instance(problem: Problem) -> tuple[str, list[Edge]]:
 
     The tie-break rule compares ascending edge-id lists lexicographically, so
     the core's edge input order MUST be id-sorted, not request-array order.
-    Returns the payload and the ordered edges for position mapping.
+    The optional segment budget rides along as the fourth header token (0 =
+    unconstrained). Returns the payload and the ordered edges for position
+    mapping.
     """
     ordered = sorted(problem.edges, key=lambda e: e.id)
+    budget = problem.max_edges if problem.max_edges is not None else 0
     lines = [
-        f"{len(problem.nodes)} {len(ordered)} {len(problem.endpoints)}",
+        f"{len(problem.nodes)} {len(ordered)} "
+        f"{len(problem.endpoints)} {budget}",
         " ".join(str(v) for v in problem.endpoints),
     ]
     for e in ordered:
@@ -122,10 +128,12 @@ def _encode_instance(problem: Problem) -> tuple[str, list[Edge]]:
 
 def run_core(
     problem: Problem, timeout: float = 30.0
-) -> tuple[int, tuple[int, ...], str, list[Edge]]:
+) -> tuple[int, tuple[int, ...], str, int | None, list[Edge]]:
     """Invoke the native solver.
 
-    Returns (cost, positions into the id-sorted edge list, status, ordered).
+    Returns ``(cost, positions into the id-sorted edge list, status,
+    min_edges, ordered)``; ``min_edges`` is the minimum feasible segment
+    count and is only set when the status is ``OVER_BUDGET``.
     """
     payload, ordered = _encode_instance(problem)
     proc = subprocess.run(
@@ -146,20 +154,35 @@ def run_core(
         cost = int(tokens[1])
         count = int(tokens[2])
         positions = tuple(int(x) for x in tokens[3:3 + count])
-        return cost, positions, status, ordered
-    return 0, (), status, ordered
+        return cost, positions, status, None, ordered
+    if status == "OVER_BUDGET":
+        return 0, (), status, int(tokens[1]), ordered
+    return 0, (), status, None, ordered
 
 
 def solve(problem: Problem) -> tuple[int, list[Edge], tuple[str, ...]]:
-    """Return ``(cost, edges, canonical edge ids)`` for the optimal subnet."""
+    """Return ``(cost, edges, canonical edge ids)`` for the optimal subnet.
+
+    With ``problem.max_edges`` set, only subnets within that segment budget
+    compete; if every connecting subnet needs more segments, a locatable
+    ``EDGE_BUDGET_EXCEEDED`` error reports the minimum feasible count.
+    """
     check_feasibility(problem)
-    cost, positions, status, ordered = run_core(problem)
+    cost, positions, status, min_edges, ordered = run_core(problem)
 
     if status == "UNCONNECTED":
         # Defensive: check_feasibility should already have caught this.
         raise TopologyError(
             "ENDPOINTS_UNCONNECTED",
             "endpoints cannot be joined by any edge set",
+        )
+    if status == "OVER_BUDGET":
+        raise TopologyError(
+            "EDGE_BUDGET_EXCEEDED",
+            f"no subnet of at most {problem.max_edges} segments joins every "
+            f"endpoint; the minimum feasible segment count is {min_edges}",
+            pointer="/max_edges",
+            min_edges=min_edges,
         )
     if status == "OVERFLOW":  # pragma: no cover - documented hard boundary
         raise TopologyError(
@@ -206,6 +229,8 @@ def _verify_witness(
     # |edges| == |vertices| - 1; guard against accidental cycles.
     if len(selected) != len(incident) - 1:
         raise RuntimeError("solver invariant: witness is not a tree")
+    if problem.max_edges is not None and len(selected) > problem.max_edges:
+        raise RuntimeError("solver invariant: witness exceeds max_edges")
 
 
 def build_adjacency(

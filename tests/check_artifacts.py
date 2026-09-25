@@ -59,6 +59,41 @@ def main() -> int:
         # Cheapest 0-3 route is the 3-edge path (ids 0,1,2) versus edge 3 (9).
         check(tokens[2:3] == ["3"], "core selects 3 edges", proc.stdout)
 
+        # Budgeted protocol: a 4th header token caps the segment count.
+        proc = subprocess.run(
+            [str(core)],
+            input="4 4 2 2\n0 3\n0 1 1\n1 2 1\n2 3 1\n0 3 9\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        check(proc.returncode == 0, "budgeted core exits zero", proc.stderr)
+        tokens = proc.stdout.split()
+        check(tokens[:1] == ["OK"], "budgeted core reports OK", proc.stdout)
+        # The 3-edge path is over budget; the 1-edge direct edge (cost 9)
+        # is the only witness within 2 segments.
+        check(tokens[1:2] == ["9"], "budgeted core finds cost 9", proc.stdout)
+        check(tokens[2:3] == ["1"], "budgeted core selects 1 edge",
+              proc.stdout)
+
+        # Budget below the minimum feasible segment count.
+        proc = subprocess.run(
+            [str(core)],
+            input="3 2 2 1\n0 2\n0 1 1\n1 2 1\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        check(proc.returncode == 0, "over-budget core exits zero",
+              proc.stderr)
+        tokens = proc.stdout.split()
+        check(tokens[:1] == ["OVER_BUDGET"], "core reports OVER_BUDGET",
+              proc.stdout)
+        check(tokens[1:2] == ["2"], "core reports min segment count 2",
+              proc.stdout)
+
     print("[artifact] python package import")
     try:
         import app.server  # noqa: F401

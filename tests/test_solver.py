@@ -320,3 +320,172 @@ class TestSolver:
         p = make(nodes, edges, ["n0", "n3", "n5"])
         cost, selected, _ = solve(p)
         assert sum(e.cost for e in selected) == cost
+
+
+# --------------------------------------------------------------------------
+# max_edges: field validation
+# --------------------------------------------------------------------------
+
+class TestMaxEdgesValidation:
+    def test_absent_by_default(self):
+        p = make(["a", "b"], [edge("e1", "a", "b", 1)], ["a", "b"])
+        assert p.max_edges is None
+
+    def test_valid_max_edges(self):
+        p = parse_problem({
+            "nodes": ["a", "b"],
+            "edges": [edge("e1", "a", "b", 1)],
+            "endpoints": ["a", "b"],
+            "max_edges": 1,
+        })
+        assert p.max_edges == 1
+
+    def test_max_edges_at_upper_bound_ok(self):
+        p = parse_problem({
+            "nodes": ["a", "b"],
+            "edges": [edge("e1", "a", "b", 1)],
+            "endpoints": ["a", "b"],
+            "max_edges": 220,
+        })
+        assert p.max_edges == 220
+
+    def check_bad_max_edges(self, bad, code):
+        with assert_raises(ValidationError) as ctx:
+            parse_problem({
+                "nodes": ["a", "b"],
+                "edges": [edge("e1", "a", "b", 1)],
+                "endpoints": ["a", "b"],
+                "max_edges": bad,
+            })
+        assert ctx.value.code == code, (bad, code, ctx.value.code)
+        assert ctx.value.pointer == "/max_edges"
+
+    def test_bad_max_edges(self):
+        for bad, code in [
+            (0, "NON_POSITIVE_MAX_EDGES"),
+            (-7, "NON_POSITIVE_MAX_EDGES"),
+            (True, "INVALID_MAX_EDGES"),
+            (2.5, "INVALID_MAX_EDGES"),
+            ("3", "INVALID_MAX_EDGES"),
+            (None, "INVALID_MAX_EDGES"),
+            ([3], "INVALID_MAX_EDGES"),
+            (221, "MAX_EDGES_OUT_OF_RANGE"),
+            (10**12, "MAX_EDGES_OUT_OF_RANGE"),
+        ]:
+            self.check_bad_max_edges(bad, code)
+
+
+# --------------------------------------------------------------------------
+# Solver under a segment budget
+# --------------------------------------------------------------------------
+
+class TestBudgetedSolver:
+    STAR_VS_PATH = (
+        ["a", "b", "c", "r"],
+        [
+            edge("e1", "a", "r", 5),
+            edge("e2", "b", "r", 5),
+            edge("e3", "c", "r", 5),
+            edge("p1", "a", "b", 9),
+            edge("p2", "b", "c", 9),
+        ],
+        ["a", "b", "c"],
+    )
+
+    def make_budgeted(self, budget):
+        nodes, edges, endpoints = self.STAR_VS_PATH
+        return parse_problem({
+            "nodes": nodes,
+            "edges": edges,
+            "endpoints": endpoints,
+            "max_edges": budget,
+        })
+
+    def test_unconstrained_picks_cheap_star(self):
+        nodes, edges, endpoints = self.STAR_VS_PATH
+        cost, _, ids = solve(make(nodes, edges, endpoints))
+        assert cost == 15
+        assert ids == ("e1", "e2", "e3")
+
+    def test_budget_forces_pricier_shorter_tree(self):
+        cost, selected, ids = solve(self.make_budgeted(2))
+        assert cost == 18
+        assert ids == ("p1", "p2")
+        assert len(selected) == 2
+
+    def test_budget_equal_to_witness_size_keeps_optimum(self):
+        cost, selected, ids = solve(self.make_budgeted(3))
+        assert cost == 15
+        assert ids == ("e1", "e2", "e3")
+        assert len(selected) == 3
+
+    def test_non_binding_budget_matches_unconstrained(self):
+        cost, _, ids = solve(self.make_budgeted(220))
+        assert cost == 15
+        assert ids == ("e1", "e2", "e3")
+
+    def test_tie_break_under_budget(self):
+        # The unconstrained optimum is the 3-segment star q1,q2,q3 (cost 3);
+        # with max_edges=2 three 2-segment trees tie at cost 6 and the
+        # lexicographically smallest sorted id list must win.
+        p = parse_problem({
+            "nodes": ["a", "b", "c", "r"],
+            "edges": [
+                edge("q1", "a", "r", 1),
+                edge("q2", "r", "b", 1),
+                edge("q3", "r", "c", 1),
+                edge("zz", "a", "c", 3),
+                edge("aa", "a", "b", 3),
+                edge("bb", "b", "c", 3),
+            ],
+            "endpoints": ["a", "b", "c"],
+            "max_edges": 2,
+        })
+        cost, selected, ids = solve(p)
+        assert cost == 6
+        assert ids == ("aa", "bb")
+        assert len(selected) == 2
+
+    def test_over_budget_reports_min_edges(self):
+        p = parse_problem({
+            "nodes": ["a", "b", "c"],
+            "edges": [edge("ab", "a", "b", 1), edge("bc", "b", "c", 1)],
+            "endpoints": ["a", "c"],
+            "max_edges": 1,
+        })
+        with assert_raises(TopologyError) as ctx:
+            solve(p)
+        assert ctx.value.code == "EDGE_BUDGET_EXCEEDED"
+        assert ctx.value.min_edges == 2
+        assert ctx.value.pointer == "/max_edges"
+
+    def test_over_budget_min_edges_through_relays(self):
+        # Cheapest-cost tree uses the relay (3 segments); the budget of 2 is
+        # still infeasible because no 2-segment tree joins a, b, c here.
+        p = parse_problem({
+            "nodes": ["a", "b", "c", "r"],
+            "edges": [
+                edge("ra", "r", "a", 1),
+                edge("rb", "r", "b", 1),
+                edge("rc", "r", "c", 1),
+            ],
+            "endpoints": ["a", "b", "c"],
+            "max_edges": 2,
+        })
+        with assert_raises(TopologyError) as ctx:
+            solve(p)
+        assert ctx.value.code == "EDGE_BUDGET_EXCEEDED"
+        assert ctx.value.min_edges == 3
+
+    def test_budget_one_with_parallel_edges(self):
+        # Parallel edges: the cheapest single segment must be chosen.
+        p = parse_problem({
+            "nodes": ["a", "b"],
+            "edges": [edge("z-slow", "a", "b", 9), edge("a-fast", "a", "b", 2)],
+            "endpoints": ["a", "b"],
+            "max_edges": 1,
+        })
+        cost, selected, ids = solve(p)
+        assert cost == 2
+        assert ids == ("a-fast",)
+        assert len(selected) == 1

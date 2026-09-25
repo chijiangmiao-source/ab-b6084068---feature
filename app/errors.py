@@ -29,8 +29,10 @@ class ValidationError(Exception):
 class TopologyError(Exception):
     """The input is well formed but the required endpoints cannot be met.
 
-    Covers dangling (isolated) endpoints and endpoints split across connected
-    components (HTTP 422). Never carries a partial subnet.
+    Covers dangling (isolated) endpoints, endpoints split across connected
+    components, and segment budgets below every feasible subnet (HTTP 422).
+    Never carries a partial subnet. ``min_edges`` is set only for the
+    budget-exceeded case and reports the minimum feasible segment count.
     """
 
     def __init__(
@@ -39,12 +41,14 @@ class TopologyError(Exception):
         message: str,
         pointer: str = "",
         components: list[list[str]] | None = None,
+        min_edges: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.pointer = pointer
         self.components = components or []
+        self.min_edges = min_edges
 
     def to_dict(self) -> dict[str, Any]:
         body: dict[str, Any] = {"code": self.code, "message": self.message}
@@ -52,4 +56,6 @@ class TopologyError(Exception):
             body["pointer"] = self.pointer
         if self.components:
             body["components"] = self.components
+        if self.min_edges is not None:
+            body["min_edges"] = self.min_edges
         return body

@@ -7,7 +7,11 @@ Zero third-party dependencies (urllib only). Covers:
   * infeasibility boundaries: dangling endpoint, split components,
   * stable locatable 4xx errors: malformed JSON, non-positive cost,
     self loop, duplicate edge id, unknown node,
-  * request isolation: a failing audit must not bleed into the next one.
+  * request isolation: a failing audit must not bleed into the next one,
+  * segment budgets: constrained optimum with echoed edge_count, non-binding
+    budgets, tie arbitration under budget, budget-insufficient 422 with the
+    minimum feasible count, max_edges field validation, and byte-level
+    compatibility of legacy (unbudgeted) requests.
 
 Exits non-zero on the first failed check, printing a readable report.
 """
@@ -258,6 +262,130 @@ def main() -> int:
           "good request after bad is fresh", str(b2))
     check(s3 == 200 and b3 == b2, "identical requests -> identical results",
           f"{b2} != {b3}")
+
+    # --- 6. segment budget: constrained optimum & legacy compat -----------
+    print("[6] max_edges constrained optimum / legacy compatibility")
+    star_vs_path = {
+        "nodes": ["A", "B", "C", "R"],
+        "edges": [
+            edge("e1", "A", "R", 5),
+            edge("e2", "B", "R", 5),
+            edge("e3", "C", "R", 5),
+            edge("p1", "A", "B", 9),
+            edge("p2", "B", "C", 9),
+        ],
+        "endpoints": ["A", "B", "C"],
+    }
+    # Legacy request (no max_edges): the 3-segment star wins at cost 15 and
+    # the response carries no edge_count field at all.
+    status, legacy = request("POST", "/api/audit", star_vs_path)
+    check(status == 200, "legacy status 200", str(legacy))
+    check(legacy.get("cost") == 15, "legacy cost 15", str(legacy.get("cost")))
+    check(legacy.get("edge_set") == ["e1", "e2", "e3"],
+          "legacy edge set", str(legacy.get("edge_set")))
+    check("edge_count" not in legacy,
+          "legacy response has no edge_count field", str(legacy))
+
+    # Non-binding budget: identical subnet, actual segment count echoed.
+    status, body = request(
+        "POST", "/api/audit", {**star_vs_path, "max_edges": 220})
+    check(status == 200, "non-binding status 200", str(body))
+    check(
+        status == 200
+        and body.get("cost") == legacy["cost"]
+        and body.get("edge_set") == legacy["edge_set"]
+        and body.get("edges") == legacy["edges"]
+        and body.get("adjacency") == legacy["adjacency"],
+        "non-binding budget matches legacy item by item",
+        str(body),
+    )
+    check(body.get("edge_count") == 3, "edge_count echoes 3", str(body))
+
+    # Binding budget: the 2-segment path wins although it costs more.
+    status, body = request(
+        "POST", "/api/audit", {**star_vs_path, "max_edges": 2})
+    check(status == 200, "budgeted status 200", str(body))
+    check(body.get("cost") == 18, "budgeted cost 18", str(body.get("cost")))
+    check(body.get("edge_set") == ["p1", "p2"],
+          "budgeted edge set", str(body.get("edge_set")))
+    check(body.get("edge_count") == 2, "edge_count echoes 2", str(body))
+    if status == 200:
+        check(len(body["edges"]) == 2 and
+              sum(e["cost"] for e in body["edges"]) == 18,
+              "budgeted edges consistent", str(body["edges"]))
+        check(set(body["adjacency"]) == {"A", "B", "C"},
+              "budgeted adjacency skips unused relay",
+              str(body.get("adjacency")))
+
+    # Tie arbitration still yields one canonical witness under the budget.
+    tie_budget = {
+        "nodes": ["a", "b", "c", "r"],
+        "edges": [
+            edge("q1", "a", "r", 1),
+            edge("q2", "r", "b", 1),
+            edge("q3", "r", "c", 1),
+            edge("zz", "a", "c", 3),
+            edge("aa", "a", "b", 3),
+            edge("bb", "b", "c", 3),
+        ],
+        "endpoints": ["a", "b", "c"],
+        "max_edges": 2,
+    }
+    status, body = request("POST", "/api/audit", tie_budget)
+    check(status == 200, "budgeted tie status 200", str(body))
+    check(body.get("cost") == 6, "budgeted tie cost 6", str(body.get("cost")))
+    check(body.get("edge_set") == ["aa", "bb"],
+          "budgeted lexicographic witness", str(body.get("edge_set")))
+    check(body.get("edge_count") == 2, "budgeted tie edge_count", str(body))
+
+    # --- 7. budget below every feasible subnet -----------------------------
+    print("[7] max_edges below the minimum feasible segment count")
+    over_budget = {
+        "nodes": ["A", "B", "C"],
+        "edges": [edge("ab", "A", "B", 1), edge("bc", "B", "C", 1)],
+        "endpoints": ["A", "C"],
+        "max_edges": 1,
+    }
+    status, body = request("POST", "/api/audit", over_budget)
+    check(status == 422, "over budget -> 422", f"got {status}")
+    check(body.get("code") == "EDGE_BUDGET_EXCEEDED",
+          "stable over-budget code", str(body))
+    check(body.get("min_edges") == 2,
+          "minimum feasible segment count reported", str(body))
+    check(body.get("pointer") == "/max_edges",
+          "over-budget pointer locatable", str(body.get("pointer")))
+    check("edge_set" not in body and "adjacency" not in body
+          and "edges" not in body,
+          "no partial subnet on over-budget", str(body))
+    # The same instance without the budget still solves normally.
+    del over_budget["max_edges"]
+    status, body = request("POST", "/api/audit", over_budget)
+    check(status == 200 and body.get("cost") == 2
+          and body.get("edge_set") == ["ab", "bc"],
+          "unbudgeted twin solves fine", str(body))
+
+    # --- 8. max_edges field validation --------------------------------------
+    print("[8] max_edges validation errors")
+    valid = {
+        "nodes": ["A", "B"],
+        "edges": [edge("e1", "A", "B", 1)],
+        "endpoints": ["A", "B"],
+    }
+    for bad, code in [
+        (0, "NON_POSITIVE_MAX_EDGES"),
+        (-4, "NON_POSITIVE_MAX_EDGES"),
+        ("2", "INVALID_MAX_EDGES"),
+        (True, "INVALID_MAX_EDGES"),
+        (2.5, "INVALID_MAX_EDGES"),
+        (None, "INVALID_MAX_EDGES"),
+        (221, "MAX_EDGES_OUT_OF_RANGE"),
+    ]:
+        status, body = request(
+            "POST", "/api/audit", {**valid, "max_edges": bad})
+        check(status == 400 and body.get("code") == code,
+              f"max_edges={bad!r} -> {code}", f"{status} {body}")
+        check(body.get("pointer") == "/max_edges",
+              f"max_edges={bad!r} pointer", str(body.get("pointer")))
 
     print("-" * 60)
     if _failures:

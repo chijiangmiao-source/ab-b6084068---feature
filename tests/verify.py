@@ -5,7 +5,9 @@ Runs, in order:
   1. solver/validation unit tests (tests/test_solver.py),
   2. build-artifact checks (tests/check_artifacts.py),
   3. HTTP smoke tests against the running API (tests/smoke_http.py),
-     including canonical tie arbitration and infeasibility boundaries.
+     including canonical tie arbitration, infeasibility boundaries,
+     max_edges-constrained optima, over-budget 422s and legacy
+     (unbudgeted) compatibility.
 
 The process prints one summary block and exits non-zero if any stage fails,
 so Compose marks the run by its exit code.

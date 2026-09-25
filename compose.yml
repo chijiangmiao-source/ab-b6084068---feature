@@ -6,8 +6,9 @@
 #              GET /healthz.
 #   verify  -- one-shot verification run: solver unit tests, build artifact
 #              checks and HTTP smoke tests (including canonical tie
-#              arbitration and infeasibility boundaries). It exits 0 on
-#              success and non-zero on any failure, then stops.
+#              arbitration, infeasibility boundaries, budgeted optima under
+#              max_edges, over-budget 422s and legacy compatibility). It
+#              exits 0 on success and non-zero on any failure, then stops.
 #
 # Typical use:
 #   AUDIT_HOST_PORT=9090 docker compose build

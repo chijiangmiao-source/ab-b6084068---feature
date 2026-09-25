@@ -4,8 +4,9 @@ Endpoints
 ---------
 * ``GET  /healthz`` -- liveness probe used by Compose.
 * ``POST /api/audit`` -- validate an instance, solve the minimum-cost subnet
-  joining every calibration endpoint, and return the canonical edge set plus
-  the adjacency list it induces.
+  joining every calibration endpoint (optionally within a ``max_edges``
+  segment budget), and return the canonical edge set plus the adjacency list
+  it induces.
 
 Failures always respond with a complete, stable error document
 (``{"code", "message", "pointer"?}``); a failed audit never returns a partial
@@ -30,20 +31,24 @@ MAX_BODY_BYTES = 2_000_000
 def _solve_payload(payload: Any) -> dict[str, Any]:
     problem = parse_problem(payload)
     cost, selected, edge_ids = solve(problem)
-    return {
+    result: dict[str, Any] = {
         "cost": cost,
         "edge_set": list(edge_ids),
-        "edges": [
-            {
-                "id": e.id,
-                "source": problem.nodes[e.source],
-                "target": problem.nodes[e.target],
-                "cost": e.cost,
-            }
-            for e in sorted(selected, key=lambda e: e.id)
-        ],
-        "adjacency": build_adjacency(problem.nodes, selected),
     }
+    if problem.max_edges is not None:
+        # Budgeted audits additionally echo the actual segment count used.
+        result["edge_count"] = len(selected)
+    result["edges"] = [
+        {
+            "id": e.id,
+            "source": problem.nodes[e.source],
+            "target": problem.nodes[e.target],
+            "cost": e.cost,
+        }
+        for e in sorted(selected, key=lambda e: e.id)
+    ]
+    result["adjacency"] = build_adjacency(problem.nodes, selected)
+    return result
 
 
 class AuditHandler(BaseHTTPRequestHandler):

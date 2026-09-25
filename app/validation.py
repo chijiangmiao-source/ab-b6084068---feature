@@ -5,12 +5,16 @@ The problem instance is::
     {
       "nodes":     [unique ASCII node ids, 2..60],
       "edges":     [{"id", "source", "target", "cost"}, 1..220],
-      "endpoints": [calibration endpoint node ids, 2..10]
+      "endpoints": [calibration endpoint node ids, 2..10],
+      "max_edges": optional positive int (<= 220) -- segment budget
     }
 
 Edges are undirected. Parallel edges between the same node pair are allowed;
 self loops and duplicate edge identifiers are rejected. Costs must be positive
 integers (bool is rejected explicitly so ``True`` does not sneak through as 1).
+When ``max_edges`` is present, only subnets using at most that many segments
+compete for the lowest cost; when it is absent the solver is unconstrained and
+the response is item-by-item identical to the legacy behaviour.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ class Problem:
     index: dict[str, int]
     edges: list[Edge]
     endpoints: list[int]  # internal indices, first-seen order
+    max_edges: int | None  # optional segment budget; None = unconstrained
 
 
 def _require_object(value: Any) -> None:
@@ -240,6 +245,38 @@ def _parse_edges(
     return edges
 
 
+def _parse_max_edges(body: dict[str, Any]) -> int | None:
+    """Optional segment budget; absent means unconstrained.
+
+    Type and range violations are rejected with a pointer to the field,
+    exactly like the cost validation on individual edges.
+    """
+    if "max_edges" not in body:
+        return None
+    value = body["max_edges"]
+    pointer = "/max_edges"
+    # bool is a subclass of int in Python; reject it explicitly.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(
+            "INVALID_MAX_EDGES",
+            "max_edges must be a positive integer",
+            pointer,
+        )
+    if value <= 0:
+        raise ValidationError(
+            "NON_POSITIVE_MAX_EDGES",
+            f"max_edges must be positive, got {value}",
+            pointer,
+        )
+    if value > MAX_EDGES:
+        raise ValidationError(
+            "MAX_EDGES_OUT_OF_RANGE",
+            f"max_edges must be <= {MAX_EDGES}, got {value}",
+            pointer,
+        )
+    return value
+
+
 def parse_problem(payload: Any) -> Problem:
     """Validate the raw JSON payload and build an indexed problem."""
     _require_object(payload)
@@ -247,4 +284,11 @@ def parse_problem(payload: Any) -> Problem:
     index = {label: i for i, label in enumerate(nodes)}
     edges = _parse_edges(payload, index)
     endpoints = _parse_endpoints(payload, index)
-    return Problem(nodes=nodes, index=index, edges=edges, endpoints=endpoints)
+    max_edges = _parse_max_edges(payload)
+    return Problem(
+        nodes=nodes,
+        index=index,
+        edges=edges,
+        endpoints=endpoints,
+        max_edges=max_edges,
+    )
